@@ -46,7 +46,6 @@ const SERVICE_LOG_PENDING_BYTES: usize = 1024 * 1024;
 const SERVICE_LOG_WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const DESKTOP_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const DESKTOP_READINESS_FRAME_MAX_BYTES: usize = 4096;
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(target_os = "macos", test))]
