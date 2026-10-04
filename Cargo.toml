@@ -273,6 +273,14 @@ container_excluded_features = [
 aarch64-linux-android = ["whatsapp-web", "plugins-wasm-cranelift"]
 arm-unknown-linux-gnueabihf = ["observability-prometheus", "plugins-wasm-cranelift"]
 armv7-unknown-linux-gnueabihf = ["observability-prometheus", "plugins-wasm-cranelift"]
+# notify 6 pulls mio 0.8, whose kqueue bindings fail to compile on NetBSD
+# (mio 0.8 predates libc 0.2.178's kevent.udata change and is EOL). The
+# filesystem channel returns when notify moves to mio 1.x.
+# wasmtime emits compile_error!(unsupported platform) for *-unknown-netbsd,
+# so the NetBSD archives carry no plugin host (same treatment as the
+# Android and ARM32 legs).
+x86_64-unknown-netbsd = ["channel-filesystem", "plugins-wasm-cranelift"]
+aarch64-unknown-netbsd = ["channel-filesystem", "plugins-wasm-cranelift"]
 
 [features]
 default = [
