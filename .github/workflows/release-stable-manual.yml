@@ -389,6 +389,161 @@ jobs:
           path: zeroclaw-${{ matrix.target }}.${{ matrix.ext }}
           retention-days: 14
 
+  # NetBSD is an experimental platform: the job is continue-on-error (same
+  # treatment as the aarch64-linux-android leg), so its failure never blocks
+  # publish. When it succeeds, the `zeroclaw-<target>` artifacts are picked up
+  # by the `zeroclaw-*` download pattern in `publish` and ship with the
+  # release. Cross-compilation uses zig: `zig cc` is clang plus NetBSD 10.1
+  # headers, crt objects and stub libc `.so` files, which Ubuntu has no
+  # gcc-*-netbsd package for and NetBSD ships no cross kits for Linux.
+  build-netbsd:
+    name: Build ${{ matrix.target }}
+    needs: [validate, web]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Tier 2: precompiled std via rustup target add, same stable pin as
+          # the other release legs.
+          - target: x86_64-unknown-netbsd
+            zig_target: x86_64-netbsd.10.1
+            toolchain: "1.98.0"
+            std: precompiled
+          # Tier 3: no precompiled std; std is built from source on nightly
+          # with -Z build-std. Never validated upstream, allowed to fail.
+          - target: aarch64-unknown-netbsd
+            zig_target: aarch64-netbsd.10.1
+            toolchain: nightly
+            std: build-std
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install zig
+        env:
+          ZIG_VERSION: 0.16.0
+        run: |
+          curl -sSfL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | tar xJ -C "$HOME"
+          echo "$HOME/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      # Install the toolchain explicitly instead of trusting the runner's
+      # preinstalled rustc (the workspace MSRV may outrun the runner image).
+      - name: Install Rust toolchain
+        env:
+          TOOLCHAIN: ${{ matrix.toolchain }}
+          TARGET: ${{ matrix.target }}
+          STD: ${{ matrix.std }}
+        run: |
+          rustup toolchain install "$TOOLCHAIN" --profile minimal
+          rustup default "$TOOLCHAIN"
+          if [ "$STD" = precompiled ]; then
+            rustup target add "$TARGET"
+          else
+            # tier 3: no precompiled std. llvm-tools provides the llvm-ar and
+            # llvm-nm that compiler_builtins wants when std is built from source.
+            rustup component add rust-src llvm-tools --toolchain "$TOOLCHAIN"
+          fi
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: web-dist
+          path: web/dist/
+
+      - name: Configure cross toolchain
+        env:
+          TARGET: ${{ matrix.target }}
+          ZIG_TARGET: ${{ matrix.zig_target }}
+        run: |
+          u=${TARGET//-/_}
+          U=${TARGET^^}; U=${U//-/_}
+          w="$PWD/.cross"
+          mkdir -p "$w"
+          for m in cc cxx; do
+            [ "$m" = cxx ] && zm='c++' || zm='cc'
+            cat > "$w/$m" <<EOF
+          #!/bin/bash
+          # the cc crate and openssl-src pass the rust triple as -target / --target=,
+          # which zig cannot parse; swap it for zig's own target syntax
+          args=(); skip=0
+          for a in "\$@"; do
+            if ((skip)); then skip=0; continue; fi
+            case "\$a" in -target|--target) skip=1; continue;; -target=*|--target=*) continue;; esac
+            args+=("\$a")
+          done
+          exec zig $zm -target $ZIG_TARGET "\${args[@]}"
+          EOF
+          done
+          cat > "$w/linker" <<EOF
+          #!/bin/bash
+          exec zig cc -target $ZIG_TARGET "\$@"
+          EOF
+          # Wrappers, not "AR=zig ar": openssl-src splits a multi-word AR.
+          printf '#!/bin/sh\nexec zig ar "$@"\n' > "$w/ar"
+          printf '#!/bin/sh\nexec zig ranlib "$@"\n' > "$w/ranlib"
+          chmod +x "$w"/*
+          {
+            echo "CC_$u=$w/cc"
+            echo "CXX_$u=$w/cxx"
+            echo "AR_$u=$w/ar"
+            echo "RANLIB_$u=$w/ranlib"
+            echo "CARGO_TARGET_${U}_LINKER=$w/linker"
+          } >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: ubuntu-22.04-${{ matrix.target }}
+
+      - name: Build release
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          STD: ${{ matrix.std }}
+        run: |
+          # Resolve the feature set from the canonical registry like every
+          # other release leg; targets without dist_target_exclusions entries
+          # get the full dist feature list.
+          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target "$TARGET")"
+          echo "Resolved features: $FEATURES"
+          if [ "$STD" = build-std ]; then
+            BUILD_STD=(-Z build-std=std,panic_abort)
+          else
+            BUILD_STD=()
+          fi
+          cargo build --release --locked --no-default-features --features "$FEATURES" --target "$TARGET" "${BUILD_STD[@]}"
+          # Ship the zerocode TUI and the zerorelay nominated relay alongside
+          # the main binary, as on the other non-Android legs.
+          cargo build --release --locked -p zerocode --target "$TARGET" "${BUILD_STD[@]}"
+          cargo build --release --locked -p zerorelay --target "$TARGET" "${BUILD_STD[@]}"
+
+      - name: Check binary size
+        shell: bash
+        run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/zeroclaw" "${{ matrix.target }}"
+        env:
+          BINARY_SIZE_HARD_LIMIT: "67108864" # 64MB cap for standard release builds
+
+      - name: Package (Unix)
+        run: |
+          mkdir -p staging/web
+          cp target/${{ matrix.target }}/release/zeroclaw staging/
+          extra=""
+          for b in zerocode zerorelay; do
+            if [ -f target/${{ matrix.target }}/release/$b ]; then
+              cp target/${{ matrix.target }}/release/$b staging/
+              extra="$extra $b"
+            fi
+          done
+          cp -r web/dist staging/web/dist
+          cd staging
+          tar czf ../zeroclaw-${{ matrix.target }}.tar.gz zeroclaw $extra web/dist
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zeroclaw-${{ matrix.target }}
+          path: zeroclaw-${{ matrix.target }}.tar.gz
+          retention-days: 14
+
   build-desktop:
     name: Build Desktop App (macOS Universal)
     needs: [validate, web]
@@ -753,9 +908,12 @@ jobs:
     name: Publish Stable Release
     # The Linux/Windows desktop jobs are continue-on-error: listing them in
     # needs only sequences the download; their failure cannot block publish.
+    # build-netbsd is continue-on-error for the same reason: it sequences the
+    # NetBSD artifacts into the `zeroclaw-*` download without gating release
+    # creation on the experimental cross-build.
     # crates-preflight is a hard gate: a release whose crates cannot publish
     # must fail before the GitHub Release makes the version public.
-    needs: [validate, release-notes, build, build-desktop, build-desktop-linux, build-desktop-windows, sbom, crates-preflight]
+    needs: [validate, release-notes, build, build-netbsd, build-desktop, build-desktop-linux, build-desktop-windows, sbom, crates-preflight]
     runs-on: ubuntu-latest
     permissions:
       contents: write
