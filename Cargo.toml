@@ -245,6 +245,11 @@ container_excluded_features = [
 aarch64-linux-android = ["whatsapp-web"]
 arm-unknown-linux-gnueabihf = ["observability-prometheus"]
 armv7-unknown-linux-gnueabihf = ["observability-prometheus"]
+# notify 6 pulls mio 0.8, whose kqueue bindings fail to compile on NetBSD
+# (mio 0.8 predates libc 0.2.178's kevent.udata change and is EOL). The
+# filesystem channel returns when notify moves to mio 1.x.
+x86_64-unknown-netbsd = ["channel-filesystem"]
+aarch64-unknown-netbsd = ["channel-filesystem"]
 
 [features]
 default = [
